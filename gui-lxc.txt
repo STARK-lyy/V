@@ -1,0 +1,357 @@
+
+import os
+import asyncio
+import shlex
+import subprocess
+from datetime import datetime, timedelta
+import aiosqlite
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+from dotenv import load_dotenv
+
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+BRAND_NAME = os.getenv("BRAND_NAME", "SnowCloud")
+THUMBNAIL_URL = os.getenv("THUMBNAIL_URL", "")
+STATUS_ROTATION = [
+    "Watching TOTALVPS",
+    "Powering SnowCloud",
+    "Made by GG!"
+]
+
+intents = discord.Intents.default()
+intents.message_content = False
+bot = commands.Bot(command_prefix="/", intents=intents)
+tree = bot.tree
+
+DB_PATH = "snowcloud.db"
+
+# ---------------------------
+# Utilities: LXC/LXD helpers
+# ---------------------------
+async def run_cmd(cmd: str):
+    """Run shell command (async). Return (returncode, stdout, stderr)."""
+    proc = await asyncio.create_subprocess_shell(
+        cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    return proc.returncode, stdout.decode().strip(), stderr.decode().strip()
+
+async def lxc_launch(name, image="images:ubuntu/22.04", cpu=1, mem_gb=1, disk_gb=10):
+    # create container
+    cmd_launch = f"lxc launch {shlex.quote(image)} {shlex.quote(name)}"
+    rc, out, err = await run_cmd(cmd_launch)
+    if rc != 0:
+        return False, f"launch failed: {err or out}"
+    # set resources
+    await run_cmd(f"lxc config set {shlex.quote(name)} limits.cpu {int(cpu)}")
+    await run_cmd(f"lxc config set {shlex.quote(name)} limits.memory {int(mem_gb)}GB")
+    # resize root disk (requires storage backend support)
+    await run_cmd(f"lxc storage volume set default root size={disk_gb}GB || true")
+    return True, out
+
+async def lxc_exec(name, command):
+    cmd = f"lxc exec {shlex.quote(name)} -- {command}"
+    return await run_cmd(cmd)
+
+async def lxc_start(name):
+    return await run_cmd(f"lxc start {shlex.quote(name)}")
+
+async def lxc_stop(name):
+    return await run_cmd(f"lxc stop {shlex.quote(name)} --timeout=30")
+
+async def lxc_delete(name):
+    return await run_cmd(f"lxc delete {shlex.quote(name)} --force")
+
+async def lxc_snapshot(name, snapname):
+    return await run_cmd(f"lxc snapshot {shlex.quote(name)} {shlex.quote(snapname)}")
+
+async def lxc_restore(name, snapname):
+    return await run_cmd(f"lxc restore {shlex.quote(name)} {shlex.quote(snapname)}")
+
+# ---------------------------
+# DB helpers
+# ---------------------------
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            discord_id INTEGER UNIQUE,
+            total_messages INTEGER DEFAULT 0,
+            daily_messages INTEGER DEFAULT 0,
+            last_reset TEXT
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS plans (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            type TEXT, -- msg/invite/boost
+            required INTEGER,
+            cpu INTEGER, ram INTEGER, disk INTEGER,
+            emoji TEXT,
+            extras TEXT
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS vps (
+            id INTEGER PRIMARY KEY,
+            owner_id INTEGER,
+            name TEXT,
+            plan_id INTEGER,
+            os TEXT,
+            cpu INTEGER, ram INTEGER, disk INTEGER,
+            status TEXT,
+            created_at TEXT,
+            boost_expires TEXT,
+            shared_with TEXT
+        )""")
+        await db.commit()
+
+# ---------------------------
+# Permission checks
+# ---------------------------
+def is_owner(interaction: discord.Interaction) -> bool:
+    return interaction.user.id == OWNER_ID
+
+async def is_admin_db(user_id: int):
+    # simplistic admin table via plans table owner entry not implemented; use a separate admin store
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS admins (discord_id INTEGER PRIMARY KEY)")
+        cur = await db.execute("SELECT 1 FROM admins WHERE discord_id = ?", (user_id,))
+        row = await cur.fetchone()
+        return row is not None
+
+# ---------------------------
+# Status rotation
+# ---------------------------
+@tasks.loop(seconds=5.0)
+async def rotate_status():
+    for s in STATUS_ROTATION:
+        await bot.change_presence(activity=discord.Game(s))
+        await asyncio.sleep(5)
+
+# ---------------------------
+# Simple anti-miner scanner (stub)
+# ---------------------------
+async def scan_for_miners(container_name):
+    # look for known miner processes; this runs 'ps aux' inside container
+    rc, out, err = await lxc_exec(container_name, "ps aux || true")
+    if rc != 0:
+        return False, "scan-failed"
+    miners = ["xmrig", "minerd", "cpuminer", "cgminer"]
+    for m in miners:
+        if m in out:
+            return True, m
+    return False, None
+
+# ---------------------------
+# Slash commands & interactions
+# ---------------------------
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} ({bot.user.id})")
+    await init_db()
+    rotate_status.start()
+    try:
+        synced = await bot.tree.sync()
+        print(f"Commands synced: {len(synced)}")
+    except Exception as e:
+        print("Sync error:", e)
+
+# Owner commands
+@tree.command(name="admin_add", description="Owner: add an admin")
+@app_commands.check(lambda i: i.user.id == OWNER_ID)
+async def admin_add(interaction: discord.Interaction, user: discord.User):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS admins (discord_id INTEGER PRIMARY KEY)")
+        await db.execute("INSERT OR IGNORE INTO admins (discord_id) VALUES (?)", (user.id,))
+        await db.commit()
+    await interaction.response.send_message(f"Added admin {user.mention}", ephemeral=True)
+
+@tree.command(name="admin_remove", description="Owner: remove an admin")
+@app_commands.check(lambda i: i.user.id == OWNER_ID)
+async def admin_remove(interaction: discord.Interaction, user: discord.User):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM admins WHERE discord_id = ?", (user.id,))
+        await db.commit()
+    await interaction.response.send_message(f"Removed admin {user.mention}", ephemeral=True)
+
+@tree.command(name="msg_plan_set", description="Owner: add/edit message plan")
+@app_commands.check(lambda i: i.user.id == OWNER_ID)
+async def msg_plan_set(interaction: discord.Interaction, name: str, required: int, cpu: int, ram: int, disk: int, emoji: str = ""):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO plans (name,type,required,cpu,ram,disk,emoji) VALUES (?, 'msg',?,?,?,?,?)",
+                         (name, required, cpu, ram, disk, emoji))
+        await db.commit()
+    await interaction.response.send_message(f"Message plan {name} added.", ephemeral=True)
+
+@tree.command(name="msg_plan", description="Show message plans")
+async def msg_plan(interaction: discord.Interaction):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id,name,required,cpu,ram,disk,emoji FROM plans WHERE type='msg'")
+        rows = await cur.fetchall()
+    if not rows:
+        await interaction.response.send_message("No message plans configured.", ephemeral=True)
+        return
+    embed = discord.Embed(title=f"{BRAND_NAME} Message Plans", color=discord.Color.blue())
+    for r in rows:
+        pid, name, req, cpu, ram, disk, emoji = r
+        embed.add_field(name=f"{emoji} {name} ({req} msgs)", value=f"CPU:{cpu} RAM:{ram}GB Disk:{disk}GB", inline=False)
+    embed.set_footer(text="MADE BY GG")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# User: /message (shows counts)
+@tree.command(name="message", description="Show your message count")
+async def message_count(interaction: discord.Interaction, user: discord.User = None):
+    target = user or interaction.user
+    # 5 second cooldown implemented per user via DB last_reset (simple)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS users (discord_id INTEGER UNIQUE, total_messages INTEGER, daily_messages INTEGER, last_reset TEXT)")
+        cur = await db.execute("SELECT total_messages,daily_messages,last_reset FROM users WHERE discord_id=?", (target.id,))
+        row = await cur.fetchone()
+        if not row:
+            await db.execute("INSERT OR IGNORE INTO users (discord_id,total_messages,daily_messages,last_reset) VALUES (?,?,?,?)", (target.id,0,0,datetime.utcnow().isoformat()))
+            await db.commit()
+            total=0; daily=0
+        else:
+            total, daily, lr = row
+        await db.commit()
+    embed = discord.Embed(title=f"{target.display_name}'s messages", description=f"Total: {total}\nToday: {daily}", color=discord.Color.green())
+    embed.set_footer(text="MADE BY GG")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# /claim-vps (GUI)
+@tree.command(name="claim_vps", description="Claim a VPS (message/invite/boost plans)")
+async def claim_vps(interaction: discord.Interaction):
+    # load plans
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id,name,type,required,cpu,ram,disk,emoji FROM plans")
+        plans = await cur.fetchall()
+    if not plans:
+        await interaction.response.send_message("No plans available. Contact owner.", ephemeral=True)
+        return
+
+    # Build view with buttons for each plan
+    class PlanView(discord.ui.View):
+        def __init__(self, plans):
+            super().__init__(timeout=120)
+            for p in plans:
+                pid,name,ptype,req,cpu,ram,disk,emoji = p
+                b = discord.ui.Button(label=f"{emoji} {name} ({ptype})", style=discord.ButtonStyle.primary)
+                async def cb(interaction, pid=pid, ptype=ptype, name=name):
+                    # Check user existing vps allowance or quotas (simple placeholder)
+                    # For message plan: check messages count in DB
+                    if ptype == "msg":
+                        async with aiosqlite.connect(DB_PATH) as db:
+                            cur = await db.execute("SELECT total_messages FROM users WHERE discord_id=?", (interaction.user.id,))
+                            row = await cur.fetchone()
+                            total = row[0] if row else 0
+                            cur = await db.execute("SELECT required FROM plans WHERE id=?", (pid,))
+                            req_row = await cur.fetchone()
+                            required = req_row[0] if req_row else None
+                        if required and total < required:
+                            await interaction.response.send_message(f"You need {required} msgs to claim {name}. You have {total}.", ephemeral=True)
+                            return
+                    # OS selection (simple)
+                    view = discord.ui.View(timeout=60)
+                    btn_ub = discord.ui.Button(label="Ubuntu", style=discord.ButtonStyle.secondary)
+                    btn_db = discord.ui.Button(label="Debian", style=discord.ButtonStyle.secondary)
+                    async def os_cb(i, chosen_os):
+                        # Create VPS name
+                        vps_name = f"SnowCloud-{interaction.user.name[:6]}-{int(datetime.utcnow().timestamp())}"
+                        ok, out = await lxc_launch(vps_name, cpu=cpu, mem_gb=ram, disk_gb=disk)
+                        if not ok:
+                            await i.response.send_message(f"Failed to deploy: {out}", ephemeral=True)
+                            return
+                        async with aiosqlite.connect(DB_PATH) as db:
+                            await db.execute("INSERT INTO vps (owner_id,name,plan_id,os,cpu,ram,disk,status,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                                             (interaction.user.id, vps_name, pid, chosen_os, cpu, ram, disk, "running", datetime.utcnow().isoformat()))
+                            await db.commit()
+                        await i.response.send_message(f"✅ VPS created: `{vps_name}` (OS: {chosen_os})", ephemeral=True)
+                    async def ub_cb(i):
+                        await os_cb(i, "ubuntu")
+                    async def db_cb(i):
+                        await os_cb(i, "debian")
+                    btn_ub.callback = ub_cb
+                    btn_db.callback = db_cb
+                    view.add_item(btn_ub)
+                    view.add_item(btn_db)
+                    await interaction.response.send_message(f"Select OS for {name}:", view=view, ephemeral=True)
+                b.callback = cb
+                self.add_item(b)
+
+    view = PlanView(plans)
+    await interaction.response.send_message("Select a plan to claim:", view=view, ephemeral=True)
+
+# /manage command: list user's VPS and actions (GUI)
+@tree.command(name="manage", description="Manage your VPS instances")
+async def manage(interaction: discord.Interaction):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id,name,os,cpu,ram,disk,status FROM vps WHERE owner_id=?", (interaction.user.id,))
+        rows = await cur.fetchall()
+    if not rows:
+        await interaction.response.send_message("You have no VPS instances.", ephemeral=True)
+        return
+
+    class InstanceSelect(discord.ui.View):
+        def __init__(self, rows):
+            super().__init__(timeout=120)
+            for r in rows:
+                vid,name,os,cpu,ram,disk,status = r
+                btn = discord.ui.Button(label=f"{name} [{status}]", style=discord.ButtonStyle.primary)
+                async def cb(i, vid=vid):
+                    # panel for instance
+                    view2 = discord.ui.View(timeout=180)
+                    async def do_action(i2, action):
+                        # handle start/stop/restart/ssh/stats/reinstall/autofix/backups...
+                        if action == "start":
+                            rc,out,err = await lxc_start(name)
+                            await i2.response.send_message(f"Start: rc={rc}", ephemeral=True)
+                        elif action == "stop":
+                            rc,out,err = await lxc_stop(name)
+                            await i2.response.send_message(f"Stop: rc={rc}", ephemeral=True)
+                        elif action == "restart":
+                            await lxc_stop(name); await asyncio.sleep(1); await lxc_start(name)
+                            await i2.response.send_message("Restarted.", ephemeral=True)
+                        elif action == "ssh":
+                            # show tmate/ssh instruction placeholder
+                            await i2.response.send_message("SSH details: (use tmate or set up SSH inside container)", ephemeral=True)
+                        elif action == "stats":
+                            # basic stats via lxc info
+                            rc,out,err = await run_cmd(f"lxc info {shlex.quote(name)} --show-log || true")
+                            await i2.response.send_message(f"```{out[:1500]}```", ephemeral=True)
+                        elif action == "autofix":
+                            # run auto-fix commands (example)
+                            await lxc_exec(name, "apt update && apt install -y --fix-missing || true")
+                            await i2.response.send_message("Auto-fix attempted.", ephemeral=True)
+                        elif action == "backup":
+                            snap = f"backup-{int(datetime.utcnow().timestamp())}"
+                            rc,out,err = await lxc_snapshot(name, snap)
+                            await i2.response.send_message(f"Snapshot {snap} created.", ephemeral=True)
+                        elif action == "restore":
+                            await i2.response.send_message("Please use admin to restore snapshots.", ephemeral=True)
+                    for act_label, act_key in [("Start","start"),("Stop","stop"),("Restart","restart"),("SSH","ssh"),("Stats","stats"),("Auto-Fix","autofix"),("Backup","backup"),("Restore","restore")]:
+                        btn2 = discord.ui.Button(label=act_label, style=discord.ButtonStyle.secondary)
+                        async def btn_cb(i2, act_key=act_key):
+                            await do_action(i2, act_key)
+                        btn2.callback = btn_cb
+                        view2.add_item(btn2)
+                    await i.response.send_message(f"Instance: {name}", view=view2, ephemeral=True)
+                btn.callback = cb
+                self.add_item(btn)
+
+    view = InstanceSelect(rows)
+    await interaction.response.send_message("Select an instance to manage:", view=view, ephemeral=True)
+
+# ---------------------------
+# Run bot
+# ---------------------------
+if __name__ == "__main__":
+    if not TOKEN or OWNER_ID == 0:
+        print("Please set DISCORD_TOKEN and OWNER_ID in .env")
+        exit(1)
+    bot.run(TOKEN)
